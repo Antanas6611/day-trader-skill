@@ -644,3 +644,195 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- pre-market
+
+PM_LIVE = os.path.join(SDIR, "premarket-spark-live-2026-11-05-045214.json")  # real, fetched 4:52:14 AM ET Nov 5
+PM_DAILY = os.path.join(SDIR, "premarket-daily-spark-2026-11-05.json")       # real 3-month daily, same 20
+
+
+def pm_series(closes, day="2026-11-05", start="04:00", prev=100.0, prev_at="2026-11-04 16:00",
+              prev_volume=5000000, itype="EQUITY", exch="NMS", vols=None, extra=None):
+    """A spark-like series of 5-minute pre-market bars from `start`, with the meta Yahoo sends."""
+    t0 = DT.strptime(day + " " + start, "%Y-%m-%d %H:%M")
+    t = [ts((t0 + datetime.timedelta(minutes=5 * i)).strftime("%Y-%m-%d %H:%M")) for i in range(len(closes))]
+    c = list(closes)
+    v = list(vols) if vols is not None else [0] * len(closes)
+    for when, price in (extra or []):
+        t.append(ts(when))
+        c.append(price)
+        v.append(0)
+    return {"t": t, "c": c, "h": None, "l": None, "o": None, "v": v,
+            "meta": {"regularMarketPrice": prev, "regularMarketTime": ts(prev_at),
+                     "regularMarketVolume": prev_volume, "instrumentType": itype, "exchangeName": exch}}
+
+
+NOW_PM = DT(2026, 11, 5, 9, 0)        # 9:00 AM ET, naive New York time
+DAY_PM = D(2026, 11, 5)
+
+
+class Premarket(unittest.TestCase):
+    def test_spark_path_unchanged_by_default(self):
+        self.assertNotIn("includePrePost", scan.spark_path(["AAPL"], "3mo", "1d"))
+        self.assertTrue(scan.spark_path(["BRK.B"], "1d", "5m", True).endswith(
+            "symbols=BRK-B&range=1d&interval=5m&includePrePost=true"))
+
+    def test_replay_real_morning(self):
+        code, out, _ = run(["premarket", "--offline", PM_LIVE, "--daily-offline", PM_DAILY,
+                            "--now", "2026-11-05 04:52", "--min-gap", "0", "--no-write", "--json"])
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        c = doc["counts"]
+        self.assertEqual((c["fetched"], c["not_stock"], c["scanned"], c["gappers"], c["stale"]), (20, 1, 19, 7, 1))
+        by = {h["symbol"]: h for h in doc["hits"]}
+        self.assertNotIn("SPY", by)                                 # an ETF is never a hit
+        a = by["AAPL"]                                              # Yahoo: 349.51 close Nov 4, 350.58 at 4:51 AM
+        self.assertEqual((a["prev_close"], a["prev_close_date"], a["pm_price"], a["pm_time"], a["gap_pct"]),
+                         (349.51, "2026-11-04", 350.58, "04:51", 0.31))
+        self.assertIsNone(a["pm_volume"])                           # Yahoo sends 0: unknown, never made up
+        self.assertEqual(by["F"]["status"], "stale")                # last print 4:15, 37 minutes old
+        self.assertEqual(doc["hits"][-1]["symbol"], "F")
+        self.assertNotIn("F", doc["top"])
+        self.assertEqual(doc["top"], ["AAPL", "AMZN", "BAC", "GOOGL", "META", "SOFI"])
+        self.assertIn("breakout_20d", a["setups"])
+        self.assertEqual(sorted(by["BAC"]["setups"]), ["oversold_bounce", "reclaim_ma20"])
+
+    def test_replay_text_says_what_is_missing(self):
+        code, out, _ = run(["premarket", "--offline", PM_LIVE, "--now", "2026-11-05 04:52", "--min-gap", "0",
+                            "--no-write"])
+        self.assertEqual(code, 0)
+        self.assertIn("Fetched 20 of 20 charts; 19 scanned", out)
+        self.assertIn("Pre-market volume: unavailable", out)
+        self.assertIn("1 of the scanned charts have no print in the last 30 minutes (stale)", out)
+        self.assertIn("setups not checked", out)                    # offline without --daily-offline
+        self.assertNotIn("DELAYED", out)
+
+    def test_min_gap_filters(self):
+        code, out, _ = run(["premarket", "--offline", PM_LIVE, "--now", "2026-11-05 04:52", "--no-write", "--json"])
+        self.assertEqual(code, 1)                                   # nothing gapped 2 % on that quiet morning
+        self.assertEqual(json.loads(out)["hits"], [])
+
+    def test_window(self):
+        for when, words in (("2026-11-05 04:02", "opens at 4:00 AM"), ("2026-11-05 09:30", "regular session opened"),
+                            ("2026-11-07 06:00", "weekend"), ("2026-11-26 06:00", "Thanksgiving")):
+            with self.assertRaises(scan.ScanError) as e:
+                scan.premarket_window(scan.parse_now(when))
+            self.assertIn(words, str(e.exception))
+        self.assertEqual(scan.premarket_window(scan.parse_now("2026-11-05 09:29")), (DAY_PM, DT(2026, 11, 5, 9, 29)))
+        code, _, err = run(["premarket", "--symbols", "AAPL", "--now", "2026-11-05 03:30", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("opens at 4:00 AM", err)
+
+    def test_points_only_what_was_known(self):
+        s = pm_series([10, 11, 12], start="08:50", extra=[("2026-11-05 08:58:30", 12.5),
+                                                          ("2026-11-05 09:31", 99.0)])
+        pts = scan.premarket_points(s, DAY_PM, NOW_PM)
+        # 8:50 and 8:55 bars are complete at 9:00, the 9:00 bar is still running, the live tick
+        # counts, 9:31 is the regular session
+        self.assertEqual([(p[0].strftime("%H:%M:%S"), p[1]) for p in pts],
+                         [("08:50:00", 10.0), ("08:55:00", 11.0), ("08:58:30", 12.5)])
+        s = pm_series([5, 6], day="2026-11-04", start="08:00")
+        self.assertEqual(scan.premarket_points(s, DAY_PM, NOW_PM), [])  # yesterday's pre-market
+
+    def test_previous_close_must_be_yesterdays(self):
+        data = {"OK": pm_series([103] * 59),
+                "LATE": pm_series([103] * 59, prev_at="2026-11-05 04:30"),   # meta stamped this morning
+                "OLD": pm_series([103] * 59, prev_at="2026-11-03 16:00"),    # did not trade yesterday
+                "FUND": pm_series([103] * 59, itype="ETF"),
+                "ARCA": pm_series([103] * 59, exch="PCX"),
+                "NONE": pm_series([None] * 59),
+                "CHEAP": pm_series([4.0] * 59, prev=3.0),
+                "THINVOL": pm_series([103] * 59, prev_volume=1000)}
+        rows, c = scan.scan_premarket(data, sorted(data) + ["GONE"], DAY_PM, NOW_PM)
+        self.assertEqual([r["symbol"] for r in rows], ["OK"])
+        self.assertEqual((c["requested"], c["fetched"], c["no_prev_close"], c["old_close"], c["not_stock"],
+                          c["no_premarket"], c["illiquid"], c["scanned"]), (9, 8, 1, 1, 2, 1, 2, 1))
+        r = rows[0]
+        self.assertEqual((r["gap_pct"], r["slots"], r["bars"], r["activity"], r["status"]), (3.0, 60, 59, 0.98,
+                                                                                        "holding_high"))
+
+    def test_status(self):
+        cases = {"holding_high": [100] * 40 + [104, 105],
+                 "pulling_back": [100] * 40 + [110, 108],
+                 "fading": [100] * 40 + [120, 110],
+                 "thin": [None] * 30 + [105] * 12}
+        data = {k: pm_series(v, start="05:30") for k, v in cases.items()}
+        data["stale"] = pm_series([105] * 10, start="05:30")       # last print 6:15 AM
+        rows, c = scan.scan_premarket(data, sorted(data), DAY_PM, NOW_PM, min_gap=0)
+        self.assertEqual({r["symbol"]: r["status"] for r in rows}, {k: k for k in data})
+        self.assertEqual(c["stale"], 1)
+        ranked = scan.rank_premarket(rows)
+        self.assertEqual(ranked[-1]["symbol"], "stale")
+        self.assertEqual(ranked[-1]["score"], 0.0)
+
+    def test_volume_from_file_or_yahoo(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        p1, p2 = os.path.join(d, "v.json"), os.path.join(d, "fmp.json")
+        with open(p1, "w") as fh:
+            json.dump({"aaa": 250000}, fh)
+        with open(p2, "w") as fh:  # FMP aftermarket-quote answers, as the connector returns them
+            json.dump([[{"symbol": "AAA", "bidPrice": 1, "volume": 174070, "timestamp": 1793871761000}],
+                       [{"symbol": "BBB", "price": 3}]], fh)
+        self.assertEqual(scan.read_pm_volumes(p1), {"AAA": 250000})
+        self.assertEqual(scan.read_pm_volumes(p2), {"AAA": 174070})
+        data = {"AAA": pm_series([105] * 59), "BBB": pm_series([105] * 59, vols=[1000] * 59)}
+        rows, c = scan.scan_premarket(data, ["AAA", "BBB"], DAY_PM, NOW_PM, pm_volumes={"AAA": 250000})
+        by = {r["symbol"]: r for r in rows}
+        self.assertEqual((by["AAA"]["pm_volume"], by["AAA"]["pm_volume_source"]), (250000, "file"))
+        self.assertEqual((by["BBB"]["pm_volume"], by["BBB"]["pm_volume_source"]), (59000, "yahoo"))
+        self.assertEqual(c["pm_volume_known"], 2)
+        no_vol = dict(by["AAA"], pm_volume=None)
+        self.assertGreater(scan.pm_score(by["AAA"]), scan.pm_score(no_vol))
+
+    def test_score_parts(self):
+        r = {"status": "holding_high", "gap_pct": 30.0, "activity": 1.0, "prev_close": 100.0,
+             "prev_volume": 10000000, "pm_volume": 1000000, "pullback_pct": 0.0,
+             "setups": ["breakout_20d", "bull_flag", "reclaim_ma20", "oversold"]}
+        self.assertEqual(scan.pm_score(r), 105.0)                   # every part at its cap; oversold alone adds nothing
+        r.update(gap_pct=10.0, activity=0.5, prev_volume=100000, pm_volume=None, pullback_pct=2.5, setups=[])
+        self.assertEqual(scan.pm_score(r), 20 + 10 + 5 + 5.0)       # $10M traded -> 5 of 15
+
+    def test_writes_a_watchlist_the_others_read(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        out = os.path.join(d, "watchlist.json")
+        code, text, _ = run(["premarket", "--offline", PM_LIVE, "--now", "2026-11-05 04:52", "--min-gap", "0.5",
+                             "--out", out, "--top", "2"])
+        self.assertEqual(code, 0)
+        with open(out) as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["mode"], "premarket")
+        self.assertEqual(doc["as_of"], "2026-11-05 04:52 ET")
+        self.assertEqual(len(doc["top"]), 2)
+        self.assertEqual(sorted(scan.symbols_from_file(out)), ["AMZN", "BAC", "F", "GOOGL", "META"])
+        self.assertIn("Wrote %s (mode premarket, 5 gappers, top 2)." % out, text)
+
+    def test_delayed_is_said(self):
+        data = {"AAA": pm_series([105] * 20)}                      # prints stop at 5:35 AM
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        p = os.path.join(d, "spark.json")
+        bundle = {"spark": {"result": [{"symbol": "AAA", "response": [{
+            "meta": data["AAA"]["meta"], "timestamp": data["AAA"]["t"],
+            "indicators": {"quote": [{"close": data["AAA"]["c"], "volume": data["AAA"]["v"]}]}}]}]}}
+        with open(p, "w") as fh:
+            json.dump(bundle, fh)
+        code, out, _ = run(["premarket", "--offline", p, "--now", "2026-11-05 05:55", "--no-write"])
+        self.assertIn("DELAYED: the newest print is 20 minutes old", out)
+        code, out, _ = run(["premarket", "--offline", p, "--now", "2026-11-05 06:30", "--no-write"])
+        self.assertEqual(code, 1)                                   # only a stale chart: no candidate
+        self.assertIn("No chart gapped up 2%+ with a fresh pre-market print.", out)
+
+    def test_live_fetch_asks_for_pre_and_post(self):
+        seen = []
+        body = json.dumps({"spark": {"result": []}})
+        old_get = scan.yahoo_get
+        scan.yahoo_get = lambda path: seen.append(path) or body
+        self.addCleanup(setattr, scan, "yahoo_get", old_get)
+        data, failed = scan.fetch_spark(["AAPL"], "1d", "5m", 0, prepost=True)
+        scan.fetch_spark(["AAPL"], "3mo", "1d", 0)
+        self.assertTrue(seen[0].endswith("&includePrePost=true"))
+        self.assertNotIn("includePrePost", seen[1])
+        self.assertEqual((data, failed), ({}, {"AAPL": "no data from Yahoo"}))

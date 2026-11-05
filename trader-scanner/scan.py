@@ -37,6 +37,19 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
           Today's daily bar is dropped until the session's close.
 
+premarket Today's pre-market, 4:05 to 9:30 AM ET (Yahoo spark with
+          includePrePost=true, 5-minute bars from 4:00 AM, 20 a request).
+          Price = the last pre-market print known at the clock; gap % against
+          yesterday's regular close (regularMarketPrice stamped before 4:00 AM
+          today and dated the previous trading day, else the chart is out).
+          Yahoo reports 0 shares for pre-market bars, so pre-market volume is
+          n/a unless --pm-volume FILE gives it ({"TSLA": 812345} or FMP
+          aftermarket-quote answers). Activity = share of 5-minute slots with a
+          print. Floors: --min-price 5 now, --min-volume 1,000,000 yesterday,
+          --min-gap 2 %. Stocks only (instrumentType EQUITY, Nasdaq / NYSE /
+          NYSE American). Daily setups for the --setup-check (40) strongest.
+          Ranked by pm_score (0 to 105); --top (10) printed, stale ones last.
+
 orb       Opening-range breakouts, 5-minute bars. The range is the first
           --or-minutes (15) of the session. Stage 1: spark closes for every
           symbol (1 day of 5-minute bars, 20 a request); a chart goes on only
@@ -61,7 +74,7 @@ requests (--pause). Partial results are reported as partial.
 
 --offline PATH reads files instead of the network: universe wants a folder
 with nasdaqlisted.txt and otherlisted.txt; daily and orb take a folder of
-<T>.json v8 chart files or spark responses, or one file that is a spark
+<T>.json v8 chart files or spark responses (premarket too), or one file that is a spark
 response, a v8 chart, or a bundle {"TSLA": <v8 json>, ...}. .json.gz is fine.
 
 A scan is a list of charts that match a rule, not a list of stocks to buy.
@@ -72,6 +85,7 @@ import argparse
 import datetime
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -271,9 +285,9 @@ def to_yahoo(sym):
     return sym.upper().replace(".", "-")
 
 
-def spark_path(symbols, rng, interval):
-    return "/v7/finance/spark?symbols=%s&range=%s&interval=%s" % (
-        ",".join(to_yahoo(s) for s in symbols), rng, interval)
+def spark_path(symbols, rng, interval, prepost=False):
+    return "/v7/finance/spark?symbols=%s&range=%s&interval=%s%s" % (
+        ",".join(to_yahoo(s) for s in symbols), rng, interval, "&includePrePost=true" if prepost else "")
 
 
 def chart_path(sym, rng, interval):
@@ -737,6 +751,226 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
     return hits, counts, failed
 
 
+# ---------------------------------------------------------------- pre-market
+
+PM_START = datetime.time(4, 0)
+PM_EXCHANGES = {"NMS", "NGM", "NCM", "NAS", "NYQ", "NYS", "ASE", "AMX"}  # Nasdaq, NYSE, NYSE American
+BULLISH = ("breakout_20d", "bull_flag", "reclaim_ma20", "oversold_bounce")
+PM_STATUS = {
+    "holding_high": "holding near the pre-market high",
+    "pulling_back": "pulled back from the pre-market high",
+    "fading": "fading: well off the pre-market high",
+    "thin": "thin: few pre-market prints",
+    "stale": "stale: no recent pre-market print",
+}
+
+
+def prev_trading_day(d):
+    d -= datetime.timedelta(days=1)
+    while not trading_day(d)[0]:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def premarket_window(now_utc, at=None, explicit_day=None):
+    """-> (day, cutoff naive ET) inside 4:05 to 9:30 AM, or raise ScanError with the plain message."""
+    now = to_eastern(now_utc)
+    day = explicit_day or now.date()
+    ok, why = trading_day(day)
+    if not ok:
+        raise ScanError("No session on %s (%s): no pre-market today. Run premarket on a trading day "
+                        "from 4:05 to 9:30 AM ET, or replay a past morning with --offline." % (day_label(day), why))
+    if at is not None:
+        cutoff = datetime.datetime.combine(day, at)
+        if explicit_day is None and cutoff > now + datetime.timedelta(seconds=59):
+            raise ScanError("--at %s is later than now (%s ET)." % (at.strftime("%H:%M"), clock_label(now)))
+    else:
+        cutoff = now.replace(second=0, microsecond=0)
+    first = datetime.datetime.combine(day, PM_START) + datetime.timedelta(minutes=BAR_MIN)
+    if cutoff < first:
+        raise ScanError("It is %s ET: the pre-market opens at 4:00 AM ET. Run premarket after %s."
+                        % (clock_label(cutoff), clock_label(first)))
+    if cutoff.time() >= OPEN:
+        raise ScanError("It is %s ET: the regular session opened at 9:30 AM and the pre-market is over. Run orb "
+                        "after 9:50 AM, or replay this morning with --at 09:15." % clock_label(cutoff))
+    return day, cutoff
+
+
+def premarket_points(series, day, cutoff):
+    """Today's pre-market prints known at `cutoff`: a 5-minute bar once complete, the live tick
+    (off the grid) once its time has passed. -> [(et, close, volume, on_grid)], oldest first."""
+    start = datetime.datetime.combine(day, PM_START)
+    end = datetime.datetime.combine(day, OPEN)
+    v = series.get("v")
+    out = {}
+    for i, ts in enumerate(series["t"]):
+        c = series["c"][i]
+        if c is None:
+            continue
+        et = ts_to_eastern(ts)
+        if et < start or et >= end:
+            continue
+        grid = not et.second and not et.minute % BAR_MIN
+        known = et + datetime.timedelta(minutes=BAR_MIN) if grid else et
+        if known > cutoff:
+            continue
+        out[et] = (et, float(c), (v[i] or 0) if v else 0, grid)
+    return [out[k] for k in sorted(out)]
+
+
+def prev_close_of(meta, day):
+    """(previous regular-session close, its date) from the chart meta. During the pre-market Yahoo's
+    regularMarketPrice is the last regular close; only trusted when stamped before today's 4:00 AM."""
+    price, when = meta.get("regularMarketPrice"), meta.get("regularMarketTime")
+    if price is None or when is None:
+        return None, None
+    et = ts_to_eastern(when)
+    if et >= datetime.datetime.combine(day, PM_START):
+        return None, None
+    return float(price), et.date()
+
+
+def pm_status(row, stale_minutes):
+    if row["age_min"] > stale_minutes:
+        return "stale"
+    if row["activity"] < 0.5:
+        return "thin"
+    if row["pullback_pct"] <= 1.0:
+        return "holding_high"
+    if row["pullback_pct"] <= 3.0:
+        return "pulling_back"
+    return "fading"
+
+
+def pm_score(row):
+    """The ranking rule, 0 to 105 points, every part from data the scan has:
+    move (gap, capped at +20 %) 40, activity (share of 5-minute slots with a print) 20,
+    liquidity (yesterday's dollar volume, $1M to $1B on a log scale) 15, pre-market volume
+    (10K to 1M shares, log scale, 0 when unknown) 10, holding the pre-market high (0 at 5 %
+    off it) 10, bullish daily setups 5 each up to 10. A stale print scores nothing."""
+    if row["status"] == "stale":
+        return 0.0
+    move = max(0.0, min(row["gap_pct"], 20.0)) / 20.0 * 40
+    act = row["activity"] * 20
+    dv = row["prev_close"] * (row["prev_volume"] or 0)
+    liq = (min(max(math.log10(dv / 1e6), 0.0), 3.0) / 3.0 * 15) if dv > 0 else 0.0
+    pv = row.get("pm_volume")
+    vol = (min(max(math.log10(pv / 1e4), 0.0), 2.0) / 2.0 * 10) if pv else 0.0
+    hold = max(0.0, 1 - row["pullback_pct"] / 5.0) * 10
+    setups = min(10, 5 * len([t for t in row.get("setups") or [] if t in BULLISH]))
+    return round(move + act + liq + vol + hold + setups, 1)
+
+
+def scan_premarket(data, symbols, day, cutoff, min_price=5.0, min_volume=1000000, min_gap=2.0,
+                   pm_volumes=None, stale_minutes=30):
+    """Pure. data = {SYM: series with pre-market bars}. Returns (rows, counts): rows are the
+    charts that gapped up at least min_gap %, unranked; counts say what was dropped and why."""
+    counts = {"requested": len(symbols), "fetched": 0, "not_stock": 0, "no_prev_close": 0, "old_close": 0,
+              "no_premarket": 0, "illiquid": 0, "scanned": 0, "stale": 0, "gappers": 0, "pm_volume_known": 0}
+    pm_volumes = pm_volumes or {}
+    want_prev = prev_trading_day(day)
+    slots = max(1, int((cutoff - datetime.datetime.combine(day, PM_START)).total_seconds() // (BAR_MIN * 60)))
+    rows = []
+    for sym in symbols:
+        s = data.get(sym)
+        if not s:
+            continue
+        counts["fetched"] += 1
+        meta = s.get("meta") or {}
+        if (meta.get("instrumentType") not in (None, "EQUITY")
+                or (meta.get("exchangeName") and meta["exchangeName"] not in PM_EXCHANGES)):
+            counts["not_stock"] += 1
+            continue
+        prev, prev_date = prev_close_of(meta, day)
+        if prev is None:
+            counts["no_prev_close"] += 1
+            continue
+        if prev_date != want_prev:
+            counts["old_close"] += 1
+            continue
+        pts = premarket_points(s, day, cutoff)
+        if not pts:
+            counts["no_premarket"] += 1
+            continue
+        last_t, last = pts[-1][0], pts[-1][1]
+        prev_vol = meta.get("regularMarketVolume")
+        if last < min_price or (min_volume > 0 and (prev_vol is None or prev_vol < min_volume)):
+            counts["illiquid"] += 1
+            continue
+        counts["scanned"] += 1
+        hi = max(p[1] for p in pts)
+        lo = min(p[1] for p in pts)
+        yahoo_vol = sum(p[2] for p in pts)
+        pm_vol, vol_src = None, None
+        if sym in pm_volumes and pm_volumes[sym] is not None:
+            pm_vol, vol_src = int(pm_volumes[sym]), "file"
+        elif yahoo_vol > 0:
+            pm_vol, vol_src = int(yahoo_vol), "yahoo"
+        row = {"symbol": sym, "prev_close": round(prev, 4), "prev_close_date": prev_date.isoformat(),
+               "prev_volume": int(prev_vol) if prev_vol is not None else None,
+               "pm_price": round(last, 4), "pm_time": last_t.strftime("%H:%M"),
+               "age_min": int((cutoff - last_t).total_seconds() // 60),
+               "gap_pct": round((last / prev - 1) * 100, 2),
+               "pm_high": round(hi, 4), "pm_low": round(lo, 4),
+               "pullback_pct": round((1 - last / hi) * 100, 2) if hi else 0.0,
+               "bars": sum(1 for p in pts if p[3]), "slots": slots,
+               "activity": round(min(1.0, sum(1 for p in pts if p[3]) / float(slots)), 2),
+               "pm_volume": pm_vol, "pm_volume_source": vol_src}
+        if pm_vol is not None:
+            counts["pm_volume_known"] += 1
+        row["status"] = pm_status(row, stale_minutes)
+        if row["status"] == "stale":
+            counts["stale"] += 1
+        if row["gap_pct"] >= min_gap:
+            rows.append(row)
+    counts["gappers"] = len(rows)
+    return rows, counts
+
+
+def rank_premarket(rows, setups=None):
+    """Attach daily setups ({SYM: [tags]} or None = not checked) and the score; best first.
+    Stale charts go last whatever their gap."""
+    for r in rows:
+        if setups is not None and r["symbol"] in setups:
+            r["setups"] = list(setups[r["symbol"]])
+        else:
+            r.setdefault("setups", None)
+        r["score"] = pm_score(r)
+    rows.sort(key=lambda r: (r["status"] == "stale", -r["score"], -r["gap_pct"], r["symbol"]))
+    for k, r in enumerate(rows, 1):
+        r["rank"] = k
+    return rows
+
+
+def read_pm_volumes(path):
+    """{SYM: shares} from a JSON file: {"TSLA": 812345, ...} or FMP aftermarket-quote answers
+    [{"symbol": "TSLA", "volume": 812345, ...}, ...] (one list or several). Missing = unknown."""
+    if not os.path.exists(path):
+        raise ScanError("no file at %s" % path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except ValueError as e:
+        raise ScanError("%s is not valid JSON: %s" % (path, e))
+    out = {}
+
+    def take(item):
+        if isinstance(item, list):
+            for x in item:
+                take(x)
+        elif isinstance(item, dict) and "symbol" in item:
+            if isinstance(item.get("volume"), (int, float)):
+                out[str(item["symbol"]).upper()] = item["volume"]
+        elif isinstance(item, dict):
+            for k, v in item.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    out[str(k).upper()] = v
+                else:
+                    take(v)
+    take(doc)
+    return out
+
+
 # ---------------------------------------------------------------- fetching
 
 def progress(a, msg):
@@ -744,7 +978,7 @@ def progress(a, msg):
         print(msg, file=sys.stderr)
 
 
-def fetch_spark(symbols, rng, interval, pause, a=None):
+def fetch_spark(symbols, rng, interval, pause, a=None, prepost=False):
     """Batches of 20. -> ({SYM: series}, {SYM: error})."""
     data, failed = {}, {}
     batches = [symbols[i:i + SPARK_MAX] for i in range(0, len(symbols), SPARK_MAX)]
@@ -753,7 +987,7 @@ def fetch_spark(symbols, rng, interval, pause, a=None):
             SLEEP(pause)
         wanted = {to_yahoo(s): s for s in batch}
         try:
-            got = parse_spark(yahoo_get(spark_path(batch, rng, interval)), wanted)
+            got = parse_spark(yahoo_get(spark_path(batch, rng, interval, prepost)), wanted)
         except (ScanError, ValueError) as e:
             for s in batch:
                 failed[s] = str(e)
@@ -1023,12 +1257,132 @@ def cmd_orb(a):
     return 0 if hits else 1
 
 
+def _vol(x):
+    return "{:,}".format(int(x)) if x is not None else "n/a"
+
+
+def cmd_premarket(a):
+    t0 = time.time()
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    data = failed = None
+    explicit_day = None
+    offline_syms = None
+    if a.offline:
+        data, failed = load_offline(a.offline)
+        offline_syms = sorted(set(data) | set(failed))
+        if not a.now:
+            days = [ts_to_eastern(s["t"][-1]).date() for s in data.values() if s["t"]]
+            if days:
+                explicit_day = max(days)
+                if at is None:
+                    raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
+    day, cutoff = premarket_window(now, at, explicit_day)
+    symbols = read_symbols(a, offline_syms)
+    pm_volumes = read_pm_volumes(a.pm_volume) if a.pm_volume else {}
+    if not a.offline:
+        if to_eastern(parse_now(None)).date() != day:
+            raise ScanError("Yahoo's live pre-market is today's only: replay %s with --offline" % day.isoformat())
+        progress(a, "Pre-market prints since 4:00 AM ET for %s symbols (%d spark requests)..."
+                 % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
+        data, failed = fetch_spark(symbols, "1d", "%dm" % BAR_MIN, a.pause, a, prepost=True)
+    rows, counts = scan_premarket(data, symbols, day, cutoff, a.min_price, a.min_volume, a.min_gap,
+                                  pm_volumes, a.stale_minutes)
+    # daily setups, for the strongest gappers only (spark daily closes, 20 a request)
+    rank_premarket(rows)
+    check = [r["symbol"] for r in rows if r["status"] != "stale"][:max(0, a.setup_check)]
+    setups, setup_note = None, "not checked"
+    if check:
+        if a.daily_offline:
+            ddata, _ = load_offline(a.daily_offline)
+        elif a.offline:
+            ddata = None
+        else:
+            progress(a, "Daily closes for the %d strongest gappers (setups)..." % len(check))
+            ddata, _ = fetch_spark(check, "3mo", "1d", a.pause)
+        if ddata is not None:
+            setups = {}
+            cut_utc = eastern_to_utc(cutoff)
+            for sym in check:
+                if sym in ddata:
+                    closes = [c for _, c in daily_closes(ddata[sym], cut_utc)]
+                    if len(closes) >= MIN_DAILY_BARS:
+                        setups[sym] = find_setups(closes)[0]
+            setup_note = "%d of the %d strongest gappers checked" % (len(setups), len(check))
+    rank_premarket(rows, setups)
+    for r in rows:
+        r["setups_checked"] = r["setups"] is not None
+        r["setups"] = r["setups"] or []
+    nfailed = len(symbols) - counts["fetched"]
+    newest = max((r["pm_time"] for r in rows), default=None)
+    as_of = "%s %s ET" % (day.isoformat(), cutoff.strftime("%H:%M"))
+    top = [r for r in rows if r["status"] != "stale"][:a.top]
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "premarket",
+           "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
+           "source": "yahoo spark includePrePost (prices); pre-market volume: %s" % (
+               "--pm-volume file" if pm_volumes else "unavailable (Yahoo reports 0)"),
+           "interval": "%dm" % BAR_MIN, "setups_checked": setup_note,
+           "filters": {"min_price": a.min_price, "min_volume": a.min_volume, "min_gap": a.min_gap,
+                       "stale_minutes": a.stale_minutes},
+           "note": NOTE, "top": [r["symbol"] for r in top], "hits": rows}
+    if a.offline:
+        doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0 if top else 1
+    print("Pre-market scan, %s %s ET: prints since 4:00 AM ET, 5-minute bars, Yahoo (free, can lag)."
+          % (day_label(day), clock_label(cutoff)))
+    print("Fetched %s of %s charts%s; %s scanned (yesterday's close on %s, $%s+ now, %s+ shares yesterday)."
+          % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
+             (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
+             "{:,}".format(counts["scanned"]), prev_trading_day(day).isoformat(), _n(a.min_price),
+             "{:,}".format(a.min_volume)))
+    dropped = [(counts["no_premarket"], "no pre-market print yet"), (counts["illiquid"], "under the floors"),
+               (counts["not_stock"], "not a Nasdaq / NYSE / NYSE American stock"),
+               (counts["no_prev_close"] + counts["old_close"], "no close from %s" % prev_trading_day(day).isoformat())]
+    dropped = [(n, w) for n, w in dropped if n]
+    if dropped:
+        print("Left out: " + ", ".join("%s %s" % ("{:,}".format(n), w) for n, w in dropped) + ".")
+    print("Last pre-market print: %s ET. %s of the scanned charts have no print in the last %d minutes (stale)."
+          % (newest or "none", "{:,}".format(counts["stale"]), a.stale_minutes))
+    if newest:
+        lag = (cutoff - datetime.datetime.combine(day, parse_hhmm(newest))).total_seconds() / 60
+        if lag > 15:
+            print("DELAYED: the newest print is %d minutes old. Yahoo may be lagging; re-run before acting." % lag)
+    if pm_volumes:
+        print("Pre-market volume: from %s for %d of %d gappers; n/a = not in the file."
+              % (os.path.basename(a.pm_volume), sum(1 for r in rows if r["pm_volume_source"] == "file"), len(rows)))
+    else:
+        print("Pre-market volume: unavailable. Yahoo reports 0 shares for pre-market bars; activity below is the "
+              "share of 5-minute slots with a print. --pm-volume FILE adds real volumes.")
+    print("Daily setups: %s." % setup_note)
+    if top:
+        print("%d of %s charts gapped up %s%%+; the %d strongest by the rule (gap, activity, liquidity, volume, "
+              "hold, setups):" % (len(rows), "{:,}".format(counts["scanned"]), _n(a.min_gap), len(top)))
+        for r in top:
+            tags = ", ".join(LABEL[t] for t in r["setups"] if t in BULLISH) or (
+                "gap only" if r["setups_checked"] else "setups not checked")
+            print("  %2d. %-6s %10s  gap %+6.2f%%  PM vol %11s  activity %3d%%  %s  [%s]  score %.1f" % (
+                r["rank"], r["symbol"], money(r["pm_price"]), r["gap_pct"], _vol(r["pm_volume"]),
+                round(r["activity"] * 100), PM_STATUS[r["status"]], tags, r["score"]))
+    else:
+        print("No chart gapped up %s%%+ with a fresh pre-market print." % _n(a.min_gap))
+    if not a.no_write:
+        print("Wrote %s (mode premarket, %d gapper%s, top %d)." % (a.out, len(rows), "" if len(rows) == 1 else "s",
+                                                                 len(top)))
+    print(NOTE + " A gap can fill at the open. Next: pick one chart, then /trader-news TICKER, and "
+          "after 9:50 AM orb or /trader-entry TICKER.")
+    return 0 if top else 1
+
+
 def _p(x):
     return "{:,.2f}".format(x)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Chart Scanner (trader-scanner): daily setups and opening-range breakouts.")
+    ap = argparse.ArgumentParser(description="Chart Scanner (trader-scanner): daily setups, pre-market gappers and opening-range breakouts.")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("universe", help="download Nasdaq Trader's lists -> trader/universe.txt")
@@ -1065,12 +1419,24 @@ def main(argv=None):
     p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
     p.add_argument("--config", default="trader/config.json")
+    p = sub.add_parser("premarket", help="today's pre-market gappers since 4:00 AM ET, ranked")
+    common(p, 5.0, 1000000)
+    p.add_argument("--min-gap", type=float, default=2.0, help="gap up at least this %% from yesterday's close (2)")
+    p.add_argument("--top", type=int, default=10, help="strongest gappers to print (10)")
+    p.add_argument("--setup-check", type=int, default=40,
+                   help="check daily setups for this many strongest gappers (40; 0 = none)")
+    p.add_argument("--stale-minutes", type=int, default=30, help="a last print older than this is stale (30)")
+    p.add_argument("--pm-volume", metavar="FILE",
+                   help='pre-market volumes: {"TSLA": 812345} or FMP aftermarket-quote answers')
+    p.add_argument("--daily-offline", metavar="PATH", help="daily closes for the setups, instead of the network")
+    p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
+        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb,
+                "premarket": cmd_premarket}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1
