@@ -4,15 +4,17 @@ description: >-
   Chart Scanner. Scans thousands of charts for setups: opening-range
   breakouts, flags, oversold bounces. Builds the list of US-listed common
   stocks, ordinary shares and ADRs from Nasdaq Trader's symbol directories,
-  runs a pre-market scan of daily closes (20-day closing-high breakout, bull
-  flag, reclaimed the 20-day average, oversold, oversold bounce) and an
+  runs a scan of daily closes (20-day closing-high breakout, bull flag,
+  reclaimed the 20-day average, oversold, oversold bounce), a live
+  pre-market gap scan from 4:00 AM ET (price, gap %, activity) and an
   intraday opening-range breakout scan on 5-minute bars, then writes
   trader/watchlist.json for trader-news and trader-entry. Free Yahoo data,
   bar by bar. Use when the user says "scan the market", "find me setups",
   "what is breaking out", "opening range breakouts", "scan for bull flags",
-  "oversold stocks", "pre-market scan", "build my watchlist", "what should I
+  "oversold stocks", "pre-market scan", "pre-market gappers", "gap up",
+  "pre-market movers", "build my watchlist", "what should I
   look at today", or at the start of a trading day before /trader-news.
-argument-hint: "[universe | daily | orb] [--at HH:MM]"
+argument-hint: "[universe | daily | premarket | orb] [--at HH:MM]"
 ---
 
 # trader-scanner
@@ -30,6 +32,7 @@ the scanner does not change that. It only saves you from flipping through
 python3 "${CLAUDE_SKILL_DIR}/scan.py" universe                       # -> trader/universe.txt
 python3 "${CLAUDE_SKILL_DIR}/scan.py" daily                          # before the open -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --symbols TSLA,NVDA,AMD  # or --watchlist FILE, --limit 200
+python3 "${CLAUDE_SKILL_DIR}/scan.py" premarket                      # 4:05 to 9:30 AM ET -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb                            # after 9:50 AM ET -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --at 10:15                 # cut the clock at 10:15 AM ET
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --watchlist trader/watchlist.json --json
@@ -99,6 +102,73 @@ A closing-high breakout fires more often than an intraday-high one (KO on
 Oct 16 broke its 20-day closing high, not its 20-day intraday high). Hits are
 listed most traded first (price times volume).
 
+## The pre-market scan (4:05 to 9:30 AM ET)
+
+`daily` only knows yesterday's close. `premarket` reads today's pre-market
+prints. It uses Yahoo's spark with `includePrePost=true`, 5-minute bars from
+4:00 AM ET, 20 symbols a request, so the whole universe takes about 297
+requests.
+
+- **Price**: the last pre-market print known at the clock. A 5-minute bar
+  counts once it is complete, and the live tick counts at its own time.
+- **Gap %**: that price against yesterday's regular close. The close is
+  Yahoo's `regularMarketPrice`, used only when it is stamped before today's
+  4:00 AM and dated the previous trading day. Otherwise the chart is left out
+  ("no close from ...").
+- **Pre-market volume**: Yahoo reports 0 shares for every pre-market bar
+  (checked live on Nov 5 2026, 1-minute and 5-minute bars). The scan never
+  makes up a number: the column says n/a. `--pm-volume FILE` adds real
+  volumes. The file is `{"TSLA": 812345}` or the FMP connector's
+  `aftermarket-quote` answers saved as JSON. On the basic plan FMP answers
+  one symbol per call, and only for some symbols: on Nov 5 2026 it gave
+  AAPL, TSLA and BABA and refused 13 others as "requires a higher plan". So
+  fill the file for the shortlist only, and expect gaps.
+- **Activity**: the share of 5-minute slots since 4:00 AM that have a print.
+- **Liquidity**: price at least `--min-price` (5) now, and yesterday's
+  regular volume at least `--min-volume` (1,000,000).
+- **Stocks only**: Yahoo's `instrumentType` must be EQUITY and the exchange
+  Nasdaq, NYSE or NYSE American. ETFs are already out of the universe; this
+  is a second check.
+- **Gappers**: up at least `--min-gap` (2 %) from yesterday's close.
+- **Daily setups**: for the `--setup-check` (40) strongest gappers, 3 months
+  of daily closes (2 spark requests) give the daily tags above. The bullish
+  ones count: breakout, flag, reclaim, oversold bounce.
+
+The ranking rule, 0 to 105 points, is printed in the output and the
+watchlist:
+
+| part | points |
+| --- | --- |
+| gap, capped at +20 % | 40 |
+| activity | 20 |
+| yesterday's dollar volume, $1M to $1B on a log scale | 15 |
+| pre-market volume, 10K to 1M shares on a log scale (0 when unknown) | 10 |
+| holding the pre-market high (0 at 5 % off it) | 10 |
+| bullish daily setups, 5 each | up to 10 |
+
+The status of each gapper:
+
+| status | when |
+| --- | --- |
+| `holding_high` | within 1 % of the pre-market high |
+| `pulling_back` | 1 to 3 % off the high |
+| `fading` | more than 3 % off the high |
+| `thin` | prints in under half the slots |
+| `stale` | no print for `--stale-minutes` (30) |
+
+A stale chart scores 0 and is never in the top. The scan prints the time of
+the newest print. When that print is more than 15 minutes old it prints
+DELAYED. `--top` (10) charts are printed. All gappers are written,
+best first, with `top[]` naming the printed ones. Before 4:05 AM, from 9:30
+AM, on a weekend or holiday it prints one plain line and writes nothing.
+Offline replay: `--offline` a saved spark answer with `--now` or `--at`,
+plus `--daily-offline` for the setups.
+
+The fixture `tests/fixtures/trader-scanner/premarket-spark-live-2026-11-05-045214.json`
+holds 20 real charts fetched at 4:52 AM ET on Nov 5 2026. AAPL closed $349.51
+on Nov 4 and printed $350.58 at 4:51 AM (+0.31 %). F's last print was at 4:15
+(stale). SPY is out (an ETF).
+
 ## The opening-range breakout scan (during the session)
 
 The opening range is the first `--or-minutes` (15) of the session: the 9:30,
@@ -145,6 +215,9 @@ are in the calendar.
 1. Once a week or so: `scan.py universe`.
 2. Before the open: `scan.py daily`. Tell the user the counts (fetched,
    liquid, scanned, hits) and the top few by setup.
+   From 4:05 AM ET: `scan.py premarket` for today's gappers. Say the time of
+   the newest print, say that pre-market volume is n/a unless a
+   `--pm-volume` file gave it, and say that a gap can fill at the open.
 3. After 9:50 AM ET (10:15 is the classic): `scan.py orb`. Tell the user how
    many usable charts broke their range and when, and that a later hit is
    closer to the price now.
